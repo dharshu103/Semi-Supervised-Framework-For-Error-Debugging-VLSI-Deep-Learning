@@ -22,25 +22,7 @@ The main objectives of this project are:
 
 # How the Project Works
 
-The project follows a series of steps:
-
-VLSI Circuit
-     ↓
-Generate Test Patterns using ATALANTA
-     ↓
-Prepare and Process the Data
-     ↓
-Extract Features using VAE
-     ↓
- ┌─────────────────┐
- │                 │
- ↓                 ↓
-CNN             Bi-LSTM
- ↓                 ↓
-Combinational    Sequential
-Circuits         Circuits
- ↓                 ↓
-     Fault Detection
+The project uses ATALANTA to generate test patterns for VLSI circuits. The patterns are processed using VAE to extract useful features. CNN is used for combinational circuits and Bi-LSTM for sequential circuits to detect faults. Finally, the results are evaluated using different performance metrics to check the accuracy of fault detection.
 
 ### Step 1: Test Pattern Generation
 
