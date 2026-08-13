@@ -137,8 +137,6 @@ These measures help us understand how effectively the models are able to identif
 The project was tested using benchmark circuits such as C432, C880, C1908, S1238 and S1488.
 The results show that deep learning can be combined with traditional ATPG techniques to support automated VLSI fault detection and debugging.The detailed results and observations can be found in the Project_Report.pdf and project_outputs.docx files included in this repository.
 
----
-
 # Applications
 
 This project can be useful in areas such as:
