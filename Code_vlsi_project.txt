@@ -1,0 +1,627 @@
+import numpy as np
+import tensorflow as tf
+import keras
+from keras import layers
+import os, warnings, re
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+from sklearn.metrics import (
+    hamming_loss, precision_recall_curve,
+    confusion_matrix, roc_auc_score,
+    roc_curve, auc, matthews_corrcoef
+)
+
+# ============================================================
+# INITIALIZATION
+# ============================================================
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    for g in gpus:
+        tf.config.experimental.set_memory_growth(g, True)
+    print(f"GPU Initialized: {gpus[0].name}")
+
+warnings.filterwarnings("ignore")
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# ============================================================
+# 1. PARSER & DATA PREP
+# ============================================================
+def is_sequential_circuit(name):
+    return os.path.basename(name).lower().startswith('s')
+
+def parse_atalanta_pat(filepath):
+    pattern_to_faults = {}
+    fault_list, fault_to_index = [], {}
+    current_fault_idx = -1
+    pattern_order = []
+
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('*') or line.startswith('Primary'):
+                continue
+
+            if re.match(r'^\d+:', line):
+                parts = line.split()
+                if len(parts) >= 3:
+                    ins  = parts[1].replace('x','0').replace('X','0')
+                    outs = parts[2].replace('x','0').replace('X','0')
+                    key  = ins + outs
+
+                    if current_fault_idx != -1:
+                        if len(pattern_order) == 0 or pattern_order[-1] != key:
+                            pattern_order.append(key)
+                        if key not in pattern_to_faults:
+                            pattern_to_faults[key] = set()
+                        pattern_to_faults[key].add(current_fault_idx)
+            else:
+                fname = line.strip()
+                if fname not in fault_to_index:
+                    fault_list.append(fname)
+                    fault_to_index[fname] = len(fault_list) - 1
+                current_fault_idx = fault_to_index[fname]
+
+    num_faults = len(fault_list)
+    X_data, Y_data = [], []
+
+    for pstr in pattern_order:
+        faults = pattern_to_faults.get(pstr, set())
+        x_row  = [int(b) for b in pstr]
+        y_row  = [0] * num_faults
+        for fi in faults:
+            y_row[fi] = 1
+        X_data.append(x_row)
+        Y_data.append(y_row)
+
+    return np.array(X_data, dtype=np.float32), np.array(Y_data, dtype=np.float32)
+
+def compute_pos_weights(Y, max_weight=25.0):
+    pw = np.ones(Y.shape[1], dtype=np.float32)
+    for i in range(Y.shape[1]):
+        p = Y[:, i].sum()
+        n = len(Y) - p
+        if p > 0:
+            pw[i] = np.clip(n / p, 1.0, max_weight)
+    return pw
+
+def create_sequences(X, Y, time_steps):
+    if time_steps <= 1:
+        return np.expand_dims(X, axis=1), Y
+    Xs, Ys = [], []
+    for i in range(len(X) - time_steps + 1):
+        Xs.append(X[i : i + time_steps])
+        Ys.append(Y[i + time_steps - 1])
+    return np.array(Xs), np.array(Ys)
+
+# ============================================================
+# 2. VAE
+# ============================================================
+class Sampling(layers.Layer):
+    def call(self, inputs):
+        z_mean, z_log_var = inputs
+        batch   = tf.shape(z_mean)[0]
+        dim     = tf.shape(z_mean)[1]
+        epsilon = tf.random.normal(shape=(batch, dim))
+        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+class StandaloneVAE(keras.Model):
+    def __init__(self, input_dim, latent_dim, beta=1.5, **kwargs):
+        super().__init__(**kwargs)
+        self.latent_dim = latent_dim
+        self.beta       = beta
+        hidden_dim      = max(64, input_dim * 2)
+
+        enc_inputs = keras.Input(shape=(input_dim,))
+        x          = layers.Dense(hidden_dim, activation="relu")(enc_inputs)
+        x          = layers.BatchNormalization()(x)
+        z_mean     = layers.Dense(latent_dim, name="z_mean")(x)
+        z_log_var  = layers.Dense(latent_dim, name="z_log_var")(x)
+        z          = Sampling()([z_mean, z_log_var])
+        self.encoder = keras.Model(enc_inputs, [z_mean, z_log_var, z], name="encoder")
+
+        dec_inputs  = keras.Input(shape=(latent_dim,))
+        x           = layers.Dense(hidden_dim, activation="relu")(dec_inputs)
+        x           = layers.BatchNormalization()(x)
+        dec_outputs = layers.Dense(input_dim, activation="sigmoid")(x)
+        self.decoder = keras.Model(dec_inputs, dec_outputs, name="decoder")
+        self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
+
+    def train_step(self, data):
+        x, _ = data
+        with tf.GradientTape() as tape:
+            z_mean, z_log_var, z = self.encoder(x, training=True)
+            reconstruction = self.decoder(z, training=True)
+            recon_loss = tf.reduce_mean(tf.reduce_sum(
+                keras.losses.binary_crossentropy(x, reconstruction), axis=-1))
+            kl_loss = -0.5 * tf.reduce_mean(tf.reduce_sum(
+                1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), axis=1))
+            total_loss = recon_loss + (self.beta * kl_loss)
+        grads = tape.gradient(total_loss, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+        self.total_loss_tracker.update_state(total_loss)
+        return {"loss": self.total_loss_tracker.result()}
+
+# ============================================================
+# 3. HYBRID CLASSIFIER
+# ============================================================
+def build_hybrid_classifier(time_steps, input_dim, latent_dim, num_faults):
+    input_seq = keras.Input(shape=(time_steps, input_dim), name="sequence_input")
+    input_z   = keras.Input(shape=(latent_dim,),           name="latent_input")
+
+    if time_steps > 1:
+        x1 = layers.Bidirectional(layers.LSTM(64, return_sequences=True))(input_seq)
+        x1 = layers.Bidirectional(layers.LSTM(64))(x1)
+        x1 = layers.BatchNormalization()(x1)
+        x1 = layers.Dropout(0.3)(x1)
+    else:
+        x1 = layers.Reshape((input_dim, 1))(input_seq)
+        x1 = layers.Conv1D(64,  kernel_size=3, padding='same', activation='relu')(x1)
+        x1 = layers.BatchNormalization()(x1)
+        x1 = layers.Conv1D(128, kernel_size=3, padding='same', activation='relu')(x1)
+        x1 = layers.BatchNormalization()(x1)
+        x1 = layers.MaxPooling1D(pool_size=2, padding='same')(x1)
+        x1 = layers.Dropout(0.3)(x1)
+        x1 = layers.Flatten()(x1)
+        x1 = layers.Dense(128, activation='relu')(x1)
+
+    x2 = layers.Dense(64)(input_z)
+    x2 = layers.BatchNormalization()(x2)
+    x2 = layers.LeakyReLU(0.1)(x2)
+
+    merged = layers.Concatenate()([x1, x2])
+
+    c = layers.Dense(256)(merged)
+    c = layers.BatchNormalization()(c)
+    c = layers.LeakyReLU(0.1)(c)
+    c = layers.Dropout(0.4)(c)
+
+    c = layers.Dense(128)(c)
+    c = layers.BatchNormalization()(c)
+    c = layers.LeakyReLU(0.1)(c)
+    c = layers.Dropout(0.2)(c)
+
+    outputs = layers.Dense(num_faults, activation="sigmoid")(c)
+    return keras.Model(inputs=[input_seq, input_z], outputs=outputs)
+
+# ============================================================
+# 4. THRESHOLD TUNING
+# ============================================================
+def tune_thresholds(Y_val, probs, nf):
+    ths = np.full(nf, 0.5)
+    for i in range(nf):
+        y_true_col = Y_val[:, i]
+        p_col      = probs[:, i]
+        if y_true_col.sum() == 0:
+            ths[i] = 0.5
+            continue
+        precs, recs, thr = precision_recall_curve(y_true_col, p_col)
+        precs, recs = precs[:-1], recs[:-1]
+        f1_scores   = 2 * (precs * recs) / (precs + recs + 1e-8)
+        best_idx    = np.argmax(f1_scores)
+        ths[i]      = thr[best_idx]
+    return np.clip(ths, 0.1, 0.9)
+
+# ============================================================
+# 5. ALL PLOTS
+# ============================================================
+def plot_confusion_matrix(Y_true, Y_pred, cname):
+    cm = confusion_matrix(Y_true.flatten(), Y_pred.flatten())
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['No Fault', 'Fault'],
+                yticklabels=['No Fault', 'Fault'])
+    plt.title(f'Confusion Matrix — {cname}', fontsize=13, fontweight='bold')
+    plt.ylabel('Actual')
+    plt.xlabel('Predicted')
+    plt.tight_layout()
+    plt.savefig(f'{cname}_confusion_matrix.png', dpi=150)
+    plt.close()
+    print(f"  [INFO] Saved → {cname}_confusion_matrix.png")
+
+
+def plot_loss_curve(history, cname):
+    plt.figure(figsize=(7, 4))
+    plt.plot(history.history['loss'],     label='Train Loss', linewidth=2, color='steelblue')
+    plt.plot(history.history['val_loss'], label='Val Loss',   linewidth=2, color='coral', linestyle='--')
+    plt.title(f'Training vs Validation Loss — {cname}', fontsize=13, fontweight='bold')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{cname}_loss_curve.png', dpi=150)
+    plt.close()
+    print(f"  [INFO] Saved → {cname}_loss_curve.png")
+
+
+def plot_roc_curve(Y_true, probs, cname):
+    # Only use columns that have both classes present
+    valid_cols = np.where(
+        (Y_true.sum(axis=0) > 0) & (Y_true.sum(axis=0) < len(Y_true))
+    )[0]
+    if len(valid_cols) == 0:
+        print(f"  [WARN] No valid columns for ROC curve — {cname}, skipping.")
+        return
+    fpr, tpr, _ = roc_curve(Y_true[:, valid_cols].flatten(),
+                             probs[:, valid_cols].flatten())
+    roc_auc_val = auc(fpr, tpr)
+    plt.figure(figsize=(6, 5))
+    plt.plot(fpr, tpr, color='steelblue', linewidth=2,
+             label=f'ROC curve (AUC = {roc_auc_val:.4f})')
+    plt.plot([0, 1], [0, 1], color='gray', linestyle='--', linewidth=1)
+    plt.title(f'ROC Curve — {cname}', fontsize=13, fontweight='bold')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.legend(loc='lower right')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{cname}_roc_curve.png', dpi=150)
+    plt.close()
+    print(f"  [INFO] Saved → {cname}_roc_curve.png")
+
+
+def plot_pr_curve(Y_true, probs, cname):
+    prec, rec, _ = precision_recall_curve(Y_true.flatten(), probs.flatten())
+    pr_auc_val   = auc(rec, prec)
+    plt.figure(figsize=(6, 5))
+    plt.plot(rec, prec, color='coral', linewidth=2,
+             label=f'PR curve (AUC = {pr_auc_val:.4f})')
+    plt.title(f'Precision-Recall Curve — {cname}', fontsize=13, fontweight='bold')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.legend(loc='upper right')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{cname}_pr_curve.png', dpi=150)
+    plt.close()
+    print(f"  [INFO] Saved → {cname}_pr_curve.png")
+
+
+def plot_all_circuits_comparison(log):
+    """Bar chart comparing all circuits across key metrics"""
+    df   = pd.DataFrame(log)
+    x    = np.arange(len(df))
+    w    = 0.2
+    cols = ['Accuracy(%)', 'Recall(%)', 'Precision(%)']
+    colors = ['steelblue', 'coral', 'mediumseagreen']
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for i, (col, color) in enumerate(zip(cols, colors)):
+        ax.bar(x + i * w, df[col], w, label=col, color=color, alpha=0.85)
+
+    ax.set_xticks(x + w)
+    ax.set_xticklabels(df['Circuit'])
+    ax.set_ylim(0, 105)
+    ax.set_ylabel('Score (%)')
+    ax.set_title('Performance Comparison Across All Circuits', fontsize=14, fontweight='bold')
+    ax.legend()
+    ax.grid(True, axis='y', alpha=0.3)
+
+    for tick, label in zip(ax.get_xticklabels(), df['Circuit']):
+        tick.set_color('steelblue' if label.startswith('C') else 'coral')
+
+    plt.tight_layout()
+    plt.savefig('all_circuits_comparison.png', dpi=150)
+    plt.close()
+    print(f"  [INFO] Saved → all_circuits_comparison.png")def plot_fault_coverage(log):
+    """Bar chart of fault coverage per circuit"""
+    df     = pd.DataFrame(log)
+    colors = ['steelblue' if c.startswith('C') else 'coral' for c in df['Circuit']]
+
+    plt.figure(figsize=(8, 5))
+    bars = plt.bar(df['Circuit'], df['Fault Coverage(%)'], color=colors, alpha=0.85)
+    plt.ylim(min(df['Fault Coverage(%)']) - 2, 101)
+    plt.ylabel('Fault Coverage (%)')
+    plt.title('Fault Coverage per Circuit', fontsize=13, fontweight='bold')
+    plt.grid(True, axis='y', alpha=0.3)
+
+    for bar, val in zip(bars, df['Fault Coverage(%)']):
+        plt.text(bar.get_x() + bar.get_width() / 2,
+                 bar.get_height() + 0.2,
+                 f'{val:.1f}%', ha='center', va='bottom', fontsize=10)
+
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor='steelblue', label='Combinational'),
+                       Patch(facecolor='coral',     label='Sequential')]
+    plt.legend(handles=legend_elements)
+    plt.tight_layout()
+    plt.savefig('fault_coverage.png', dpi=150)
+    plt.close()
+    print(f"  [INFO] Saved → fault_coverage.png")
+
+
+def plot_f1_heatmap(log):
+    """Heatmap of all metrics across circuits"""
+    df = pd.DataFrame(log)
+    metric_cols = ['Accuracy(%)', 'Recall(%)', 'Precision(%)', 'F1 Score',
+                   'ROC-AUC', 'MCC', 'Fault Coverage(%)']
+    heatmap_df  = df[['Circuit'] + metric_cols].set_index('Circuit')
+
+    norm_df = heatmap_df.copy()
+    for col in metric_cols:
+        mn, mx = norm_df[col].min(), norm_df[col].max()
+        norm_df[col] = (norm_df[col] - mn) / (mx - mn + 1e-8)
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    sns.heatmap(norm_df.T, annot=heatmap_df.T.round(2), fmt='g',
+                cmap='YlGnBu', linewidths=0.5,
+                cbar_kws={'label': 'Normalised score'},
+                ax=ax)
+    ax.set_title('Metrics Heatmap Across All Circuits', fontsize=13, fontweight='bold')
+    ax.set_ylabel('')
+    plt.tight_layout()
+    plt.savefig('metrics_heatmap.png', dpi=150)
+    plt.close()
+    print(f"  [INFO] Saved → metrics_heatmap.png")
+
+
+def plot_radar_chart(log):
+    """Radar / spider chart for each circuit"""
+    categories = ['Accuracy', 'Recall', 'Precision', 'F1×100', 'ROC-AUC×100', 'MCC×100']
+    N = len(categories)
+    angles = [n / float(N) * 2 * np.pi for n in range(N)]
+    angles += angles[:1]
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(log)))
+    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(polar=True))
+
+    for i, row in enumerate(log):
+        values = [
+            row['Accuracy(%)'],
+            row['Recall(%)'],
+            row['Precision(%)'],
+            row['F1 Score'] * 100,
+            row['ROC-AUC']  * 100,
+            row['MCC']      * 100,
+        ]
+        values += values[:1]
+        ax.plot(angles, values, linewidth=2, linestyle='solid',
+                label=row['Circuit'], color=colors[i])
+        ax.fill(angles, values, alpha=0.08, color=colors[i])
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories, size=10)
+    ax.set_ylim(0, 105)
+    ax.set_title('Radar Chart — All Circuits', size=13, fontweight='bold', pad=20)
+    ax.legend(loc='upper right', bbox_to_anchor=(1.35, 1.1))
+    plt.tight_layout()
+    plt.savefig('radar_chart.png', dpi=150)
+    plt.close()
+    print(f"  [INFO] Saved → radar_chart.png")
+
+
+def plot_hamming_loss_bar(log):
+    df     = pd.DataFrame(log)
+    colors = ['steelblue' if c.startswith('C') else 'coral' for c in df['Circuit']]
+    plt.figure(figsize=(8, 4))
+    bars = plt.bar(df['Circuit'], df['Hamming Loss'], color=colors, alpha=0.85)
+    plt.ylabel('Hamming Loss (lower is better)')
+    plt.title('Hamming Loss per Circuit', fontsize=13, fontweight='bold')
+    plt.grid(True, axis='y', alpha=0.3)
+    for bar, val in zip(bars, df['Hamming Loss']):
+        plt.text(bar.get_x() + bar.get_width() / 2,
+                 bar.get_height() + 0.00005,
+                 f'{val:.4f}', ha='center', va='bottom', fontsize=9)
+    from matplotlib.patches import Patch
+    plt.legend(handles=[Patch(facecolor='steelblue', label='Combinational'),
+                        Patch(facecolor='coral',     label='Sequential')])
+    plt.tight_layout()
+    plt.savefig('hamming_loss.png', dpi=150)
+    plt.close()
+    print(f"  [INFO] Saved → hamming_loss.png")
+
+
+# ============================================================
+# 6. MAIN EXECUTION PIPELINE
+# ============================================================
+circuit_files = [
+    'c432.pat', 'c880.pat', 'c1908.pat',
+    's1238.pat', 's1488.pat',
+]
+
+BS  = 64
+log = []
+
+print("=" * 75)
+print("  VLSI Fault Classifier — HYBRID (CNN/LSTM + VAE) + FULL METRICS")
+print("=" * 75)
+
+for circuit in circuit_files:
+    if not os.path.exists(circuit):
+        print(f"[SKIP] {circuit} not found.")
+        continue
+
+    X_raw, Y_raw = parse_atalanta_pat(circuit)
+    if len(X_raw) == 0:
+        continue
+
+    is_sq  = is_sequential_circuit(circuit)
+    cname  = circuit.split('.')[0].upper()
+    nf     = Y_raw.shape[1]
+    idim   = X_raw.shape[1]
+
+    TIME_STEPS = 10 if is_sq else 1
+
+    X_seq, Y_seq = create_sequences(X_raw, Y_raw, TIME_STEPS)
+
+    idx   = np.random.permutation(len(X_seq))
+    X_seq = X_seq[idx]
+    Y_seq = Y_seq[idx]
+
+    LATENT_DIM = max(16, idim // 2)
+
+    n  = len(X_seq)
+    te = int(0.70 * n)
+    ve = int(0.85 * n)
+
+    Xt, Yt = X_seq[:te],   Y_seq[:te]
+    Xv, Yv = X_seq[te:ve], Y_seq[te:ve]
+    Xs, Ys = X_seq[ve:],   Y_seq[ve:]
+
+    pos_weights    = compute_pos_weights(Yt, max_weight=30.0)
+    pos_weights_tf = tf.constant(pos_weights, dtype=tf.float32)
+
+    print(f"\n{'='*60}")
+    print(f"  {cname} | inputs: {idim} | steps: {TIME_STEPS} | latent: {LATENT_DIM} | faults: {nf}")
+    print(f"{'='*60}")
+
+    Xt_flat = Xt[:, -1, :]
+    Xv_flat = Xv[:, -1, :]
+    Xs_flat = Xs[:, -1, :]
+
+    # --- STAGE 1: VAE ---
+    print(">>> STAGE 1: Training Scaled Beta-VAE...")
+    vae = StandaloneVAE(idim, LATENT_DIM, beta=1.5)
+    vae.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-3))
+    vae.fit(Xt_flat, Xt_flat, epochs=50, batch_size=BS, verbose=0)
+
+    Zt, _, _ = vae.encoder.predict(Xt_flat, batch_size=BS, verbose=0)
+    Zv, _, _ = vae.encoder.predict(Xv_flat, batch_size=BS, verbose=0)
+    Zs, _, _ = vae.encoder.predict(Xs_flat, batch_size=BS, verbose=0)
+
+    # --- STAGE 2: Hybrid Classifier ---
+    print(">>> STAGE 2: Training Hybrid Classifier...")
+    classifier = build_hybrid_classifier(TIME_STEPS, idim, LATENT_DIM, nf)
+
+    def weighted_bce_loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
+        loss   = -(pos_weights_tf * y_true * tf.math.log(y_pred) +
+                   (1 - y_true) * tf.math.log(1 - y_pred))
+        return tf.reduce_mean(loss, axis=-1)
+
+    classifier.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=5e-4),
+        loss=weighted_bce_loss
+    )
+
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor='val_loss', mode='min', patience=25, restore_best_weights=True),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', mode='min', factor=0.5, patience=8, min_lr=1e-6)
+    ]
+
+    history = classifier.fit(
+        [Xt, Zt], Yt,
+        epochs=150,
+        batch_size=BS,
+        validation_data=([Xv, Zv], Yv),
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    # --- PREDICT ---
+    probs_val  = classifier.predict([Xv, Zv], batch_size=BS, verbose=0)
+    ths        = tune_thresholds(Yv, probs_val, nf)
+
+    probs_test = classifier.predict([Xs, Zs], batch_size=BS, verbose=0)
+    y_pred_bin = (probs_test > ths).astype(int)
+
+    # ── CORE METRICS ──────────────────────────────────────────
+    acc  = np.mean(y_pred_bin == Ys)
+    tp   = np.sum((y_pred_bin == 1) & (Ys == 1))
+    fp   = np.sum((y_pred_bin == 1) & (Ys == 0))
+    fn   = np.sum((y_pred_bin == 0) & (Ys == 1))
+
+    rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    f1   = 2 * prec * rec / (prec + rec + 1e-8)
+
+    # ── ADDITIONAL METRICS ────────────────────────────────────
+
+    # 1. Hamming Loss
+    hl = hamming_loss(Ys, y_pred_bin)
+
+    # 2. ROC-AUC — only over columns where both classes are present in Ys
+    try:
+        valid_cols = np.where(
+            (Ys.sum(axis=0) > 0) & (Ys.sum(axis=0) < len(Ys))
+        )[0]
+        if len(valid_cols) > 0:
+            roc_auc = roc_auc_score(
+                Ys[:, valid_cols],
+                probs_test[:, valid_cols],
+                average='macro'
+            )
+        else:
+            roc_auc = 0.0
+    except ValueError:
+        roc_auc = 0.0
+
+    # 3. Matthews Correlation Coefficient
+    mcc = matthews_corrcoef(Ys.flatten(), y_pred_bin.flatten())
+
+    # 4. Fault Coverage — how many unique faults detected at least once
+    detected_faults = int(np.sum(np.any(y_pred_bin == 1, axis=0)))
+    fault_coverage  = (detected_faults / nf) * 100
+
+    # ── PLOTS ────────────────────────────────────────────────
+    print(f">>> Generating plots for {cname}...")
+    plot_confusion_matrix(Ys, y_pred_bin, cname)
+    plot_loss_curve(history, cname)
+    plot_roc_curve(Ys, probs_test, cname)
+    plot_pr_curve(Ys, probs_test, cname)
+
+    # ── PRINT RESULTS ────────────────────────────────────────
+    print(f"\n[RESULTS] {cname}")
+    print(f"  Accuracy      : {acc*100:6.2f}%")
+    print(f"  Recall        : {rec*100:6.2f}%")
+    print(f"  Precision     : {prec*100:6.2f}%")
+    print(f"  F1 Score      : {f1:.4f}")
+    print(f"  ROC-AUC       : {roc_auc:.4f}")
+    print(f"  MCC           : {mcc:.4f}")
+    print(f"  Hamming Loss  : {hl:.4f}")
+    print(f"  Fault Coverage: {fault_coverage:.2f}%")
+
+    log.append({
+        "Circuit":           cname,
+        "Accuracy(%)":       round(acc  * 100, 2),
+        "Recall(%)":         round(rec  * 100, 2),
+        "Precision(%)":      round(prec * 100, 2),
+        "F1 Score":          round(f1,          4),
+        "ROC-AUC":           round(roc_auc,      4),
+        "MCC":               round(mcc,           4),
+        "Hamming Loss":      round(hl,            4),
+        "Fault Coverage(%)": round(fault_coverage, 2)
+    })
+
+# ── SUMMARY PLOTS (after all circuits) ──────────────────────
+if log:
+    print("\n>>> Generating summary plots...")
+    plot_all_circuits_comparison(log)
+    plot_fault_coverage(log)
+    plot_f1_heatmap(log)
+    plot_radar_chart(log)
+    plot_hamming_loss_bar(log)
+
+    df = pd.DataFrame(log)
+    print("\n" + "=" * 90)
+    print("  FINAL PERFORMANCE SUMMARY")
+    print("=" * 90)
+    import IPython.display
+    IPython.display.display(df)
+
+    df.to_csv('vlsi_results_summary.csv', index=False)
+    print("\n  [INFO] Saved → vlsi_results_summary.csv")
+
+    print("\n" + "=" * 90)
+    print("  FILES SAVED")
+    print("=" * 90)
+    circuits_done = [r['Circuit'] for r in log]
+    print("  Per-circuit (one each):")
+    for c in circuits_done:
+        print(f"    {c}_confusion_matrix.png")
+        print(f"    {c}_loss_curve.png")
+        print(f"    {c}_roc_curve.png")
+        print(f"    {c}_pr_curve.png")
+    print("  Summary:")
+    print("    all_circuits_comparison.png")
+    print("    fault_coverage.png")
+    print("    metrics_heatmap.png")
+    print("    radar_chart.png")
+    print("    hamming_loss.png")
+    print("    vlsi_results_summary.csv")
